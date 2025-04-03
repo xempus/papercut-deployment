@@ -1,2 +1,2 @@
 # papercut-deployment
-Papercut Deployment
+Papercut Deployment for OSX
