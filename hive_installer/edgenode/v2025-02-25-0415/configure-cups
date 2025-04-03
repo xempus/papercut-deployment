@@ -1,0 +1,1302 @@
+#!/usr/bin/perl -w
+#
+# (c) Copyright 1999-2023 PaperCut Software International Pty Ltd
+#
+# A simple interactive script to configure the CUPS printers.conf file.
+#
+# A backup of a changed printers.conf file is created in:
+#   /etc/cups/printers.conf.yy-mm-dd-hh-mm-ss
+#
+use strict;
+use Sys::Hostname;
+use Getopt::Long 'HelpMessage';
+use version;
+
+my $arg_0 = $0;
+my $prefix = 'papercut';
+my $product = 'PaperCut';
+
+if ($prefix =~ /\@$/) {
+    # Using non installed version so just default to papercut
+    # Done for internal use
+    $prefix = "papercut";
+    $product = "PaperCut";
+}
+
+my $cups_dir = "/etc/cups";
+my $cups_file = "$cups_dir/printers.conf";
+my $printer;
+my $printer_full_name;
+my @activeprinters;
+my @inactiveprinters;
+my $interactive = 1;
+my $expert_options = "";      # set to string showing the extra options
+my $dirty = 0; # is a CUPS config file destined to be changed because of enable/disable of papercut
+my $read_only = 0;
+my $ncmd = 0;
+my $pp_config_file = "./print-provider.conf";
+
+sub show_auto_import_enabled_warning {
+    print "---------------------------- WARNING -----------------------------\n";
+    print "Currently all of the printers are automatically imported for\n";
+    print "monitoring because EnablePrinterAutoImport=on is present in\n";
+    print "print-provider.conf. Because of that, any changes you make by\n";
+    print "running this command will get overridden.\n";
+    print "\n";
+    print "To automatically disable auto import:\n";
+    print "1. Type yes. The EnablePrinterAutoImport will be disabled and the\n";
+    print "   Print Provider will restart.\n";
+    print "2. Run this command again to make changes.\n";
+    print "\n";
+    print "To manually disable auto import:\n";
+    print "1. Type no.\n";
+    print "2. Set EnablePrinterAutoImport=off in print-provider.conf.\n";
+    print "3. Restart the Print Provider.\n";
+    print "4. Run this command again to make changes.\n";
+    print "------------------------------------------------------------------\n";
+}
+
+#
+# Command-line options used as part of the installer/uninstaller
+#
+GetOptions(
+    'add-all' => \my $add_all,
+    'remove-all' => \my $remove_all,
+    'list-all' => \my $list_all,
+    'expert' => \my $expert,
+    'list' => \my $do_list,
+    'add=s' => \my $add_printer,
+    'remove=s' => \my $remove_printer,
+    'hidecreds' => \my $fix_creds,
+    'relax-sandbox' => \my $relax_sandbox,
+    'help' => sub { HelpMessage(0) },
+) or HelpMessage(1);
+
+$ncmd++ if ($add_all);
+$ncmd++ if ($remove_all);
+$ncmd++ if ($list_all);
+$ncmd++ if ($expert);
+$ncmd++ if ($do_list);
+$ncmd++ if ($add_printer);
+$ncmd++ if ($remove_printer);
+$ncmd++ if ($fix_creds);
+$ncmd++ if ($relax_sandbox);
+
+#
+# Look for left over arguments
+# Backward compatible with "add-all" and "remove-all"
+#
+foreach my $arg (@ARGV) {
+    if ("add-all" eq $arg) {
+        $add_all = 1;
+        $ncmd++;
+    } elsif ("remove-all" eq $arg) {
+        $remove_all = 1;
+        $ncmd++;
+    } else {
+        HelpMessage(1);
+    }
+}
+
+if ($ncmd > 1) {
+    die("You cannot specify more than one command option");
+}
+
+if ($add_all || $remove_all || $list_all || $do_list || $add_printer || $remove_printer || $fix_creds || $relax_sandbox) {
+    $interactive = 0;
+}
+
+if ($do_list || $list_all) {
+    $read_only = 1;
+}
+
+if ($expert) {
+    # this just determines if they see the extra options or not (we still allow them :-)
+    $expert_options = "/(f)ilter-enable";
+}
+
+if ($relax_sandbox) {
+    configure_cups_sandbox();
+    exit 0;
+}
+
+#
+# in High Sierra and later versions of MacOS, newly added printers in CUPS takes minutes to
+# appear in printers.conf (but are available via `lpstat` immediately).
+# so, as a qucik fix, restart CUPS now to update printers.conf with latest printer details.
+# using `lpstat` instead of directly looking in printers.conf seems a better way.
+# NOTE: we could check for the version and not restart if older than High Sierra, but
+# restarting CUPS is low cost, so do it for all MacOS versions.
+# TODO: remove this when Apple fix this bug.
+if (`uname` =~ /Darwin/i) {
+    print "CUPS needs to be restarted to update config files.\n";
+    restart_cups();
+    sleep(2);
+}
+
+if (! -e $cups_file) {
+    die("Cannot find $cups_file file.\n")
+}
+
+if (! -w $cups_file) {
+    die("Unable to edit CUPS config file $cups_file. Are you running as root?\n");
+}
+
+
+open IN, "< $cups_file" or die "Unable to open $cups_file : $!";
+
+if ($interactive) {
+    print "\n";
+    print "============================ $product ============================\n\n";
+    print "This command will take you through the process of enabling $product\n";
+    print "on your printers.\n\n";
+
+    # If EnablePrinterAutoImport is set, any changes we do here will get overridden.
+    # Check if it is set, and if so, warn the user and offer to disable the configuration.
+    my $key = "EnablePrinterAutoImport";
+    if (is_pp_config_set($key)) {
+        show_auto_import_enabled_warning();
+        print "Disable now? (yes|no)\n";
+        print "--> ";
+        my $res = <STDIN>;
+        if ($res =~ /^yes$/i) {
+            if (delete_pp_config($key)) {
+                print "Disabled printer auto import. Restarting the Print Provider.\n";
+                restart_pp();
+                print "Restarted the Print Provider. Ready to re-run the command again now.\n";
+            }
+        } else {
+            print "Exiting. Set enablePrinterAutoImport=off in print-provider.conf\n";
+            print "and run this command again.\n";
+        }
+        exit 0;
+    }
+}
+
+configure_cups_sandbox();
+
+#
+# Backup cups config file in case of any changes.
+# I can't wait to know if changes as we are using the lpadmin(8) command immediately to
+# indirectly modify the printers.conf file.
+#
+my $backup = $cups_file . "." . timestamp();
+my $cups_file_arg = quotemeta($cups_file);
+my $backup_arg = quotemeta($backup);
+print `cp $cups_file_arg $backup_arg`;
+
+# go thru each line in printers.conf
+while (<IN>) {
+    my $line = $_;
+    chomp($line);
+    if ($line =~ /^\s*<Printer\s+(\S+?)\s*>/i || $line =~ /^\s*<DefaultPrinter\s+(\S+?)\s*>/i) {
+
+        $printer = $1;
+        $printer_full_name = "";
+
+    } elsif ($line =~ /^\s*Info\s+(.*)$/) {
+
+        $printer_full_name = $1;
+
+    } elsif ($line =~ /^\s*DeviceURI\s+(\S+)/i) {
+
+        my $uri = $1;
+        my $response = "";
+        my $delete = 0;
+        my $haschanged = 0;
+        my $expert_enable_filter = 0; # whether someone is overriding with a papercut filter
+
+        # if using papercut backend or papercut filter
+        if ($uri =~ /^$prefix\:/ || is_using_provider_filter($printer, $prefix)) {
+            #
+            # Currently Enabled
+            #
+            if ($interactive) {
+                print "Printer: " . printername($printer, $printer_full_name) . "\n";
+                print "Status: control currently ENABLED\n";
+                printf "Change the status? [(e)nabled/(d)isabled/(L)eave%s]\n", $expert_options;
+                print "--> ";
+                $response = <STDIN>;
+                print "\n"
+            }
+
+            $expert_enable_filter = ($response =~ /^f/i);
+            $delete = ($response =~ /^d/i || $remove_all || ($remove_printer && $remove_printer eq $printer));
+
+            if ($delete) {
+
+                # delete the existing one
+
+                if (is_using_canonij_filter($printer)) {
+                    # Special Mac Hack for Canon IJ printers
+                    $haschanged = restore_specific_ppd_filter($printer, $prefix);
+                } elsif (is_using_provider_filter($printer, $prefix)) {
+                    $haschanged = restore_ppd_filter($printer, $prefix);
+                } else {
+                    $haschanged = restore_old_backend($printer, $line);
+                }
+
+            } elsif ($expert_enable_filter && !is_using_provider_filter($printer, $prefix)) {
+                if (replace_ppd_filter($printer, $prefix, 1)) {
+                    # remove papercut backend if it has one
+                    $haschanged = restore_old_backend($printer, $line);
+                    if ($interactive) {
+                        print "Enabled $prefix filter on printer, $printer\n\n";
+                    }
+                }
+            } elsif ($fix_creds && !is_using_provider_filter($printer, $prefix)) {
+                # will remain enabled but will change the format of the URL to be conformant without extra creds
+                # if contains any creds - recognise by @ symbol
+                if ($fix_creds && has_credentials($uri)) {
+                    $haschanged = make_conformant($printer, $line);
+                    if ($haschanged) {
+                        printf("Credentials hidden for URI on %s.\n", $printer);
+                    } else {
+                        printf("Credentials already hidden for URI on %s.\n", $printer);
+                    }
+                } else {
+                    printf("No credentials to hide on %s.\n", $printer);
+                }
+            }
+
+            # if we keep this printer as enabled then add it in
+            if (!$delete || ($delete && !$haschanged)) {
+                push @activeprinters, $printer;
+            } else {
+                push @inactiveprinters, $printer;
+                if ($remove_printer) {
+                    print "Removed printer $printer from monitoring\n";
+                }
+            }
+
+        } else {
+            #
+            # Currently Disabled
+            #
+            if ($interactive) {
+                print "Printer: " . printername($printer, $printer_full_name) . "\n";
+                print "Status: control currently DISABLED\n";
+                printf "Change the status? [(e)nabled/(d)isabled/(L)eave%s]\n", $expert_options;
+                print "--> ";
+                $response = <STDIN>;
+                print "\n"
+            }
+
+            #
+            # enabling cases
+            #
+            if ($response =~ /^e/i || $add_all || ($add_printer && $add_printer eq $printer)) {
+                if ($line =~ /file:\/+dev\/null/
+                        && is_using_printmgr_filter($printer)) {
+                    # Special Mac Hack for Epson/Canon printers
+                    $haschanged = replace_ppd_filter($printer, $prefix, 0);
+                } elsif (is_using_epson_filter($printer)) {
+                    # Special Mac Hack for Epson printers using CUPS Raster
+                    if (is_using_cupsprefilter($printer)) {
+                           # Deal with the case of "prefilters" that will otherwise preempt our papercut filter
+                           $haschanged = replace_ppd_prefilter($printer, $prefix, 0);
+                    } else {
+                           # Deal with the usual case (ie, no prefilter)
+                           $haschanged = replace_ppd_filter($printer, $prefix, 0);
+                    }
+                } elsif (is_using_garo_filter($printer)) {
+                    # Special Mac Hack for Canon GARO
+                    $haschanged = replace_ppd_filter($printer, $prefix, 0);
+                } elsif (is_using_canonij_filter($printer)) {
+                    # Special Mac Hack for Canon IJ printers
+                    $haschanged = replace_specific_ppd_filter($printer, "Raster2CanonIJ", $prefix);
+                } elsif (is_using_canonufr_filter($printer)) {
+                    # Special Mac Hack for Canon UFR printers
+                    $haschanged = replace_ppd_filter($printer, $prefix, 0);
+                } elsif (is_using_canonlbp6710_filter($printer)) {
+                    # Special Mac Hack for Canon LBP6710 printers
+                    $haschanged = replace_ppd_filter($printer, $prefix, 0);
+                } elsif (is_using_xerox_filter($printer) || has_credentials($uri)) {
+                    $haschanged = add_url_conformant_papercut_backend($printer, $line);
+                } else {
+                    $haschanged = add_papercut_backend($printer, $line);
+                }
+            } elsif ($response =~ /^f/i) {
+                # use the filter because we were asked to!
+                $haschanged = replace_ppd_filter($printer, $prefix, 1);
+                if ($haschanged && $interactive) {
+                    print "Enabled $prefix filter on printer, $printer\n\n";
+                }
+            }
+
+            # Currently disabled, so if we make a change, then must be enabling it
+            if ($haschanged) {
+                push @activeprinters, $printer;
+                if ($add_printer) {
+                    print "Added printer $printer for monitoring\n";
+                }
+            } else {
+                push @inactiveprinters, $printer;
+            }
+        }
+
+        if ($haschanged) {
+            # we have made a change and so note it for any restarts
+            $dirty = 1;
+        }
+    }
+}
+
+close IN;
+
+if ($interactive || $do_list || $list_all || $add_all || $remove_all || $fix_creds) {
+    print "Monitoring currently enabled on " . @activeprinters . " printers.\n";
+    if (@activeprinters > 0) {
+        print "Enabled printers include: @activeprinters\n";
+    }
+}
+
+if ($list_all) {
+    print "Monitoring currently disabled on " . @inactiveprinters . " printers.\n";
+    if (@inactiveprinters > 0) {
+        print "Disabled printers include: @inactiveprinters\n";
+    }
+}
+
+if (!$read_only && $dirty) {
+    restart_cups();
+}
+
+#
+# Local Subs below
+#
+#
+sub is_mac_10_10_or_above_sandboxing_enabled {
+    if (`uname` =~ /Darwin/i) {
+        my $productVersion = `sw_vers -productVersion`;
+        chomp $productVersion;
+        if (-e "/etc/cups/cups-files.conf" && version->parse($productVersion) >= version->parse("10.10.0")) {
+            my $exit_code = system('egrep -qi "^[[:space:]]*Sandboxing[[:space:]]+(off|relaxed)" /etc/cups/cups-files.conf');
+            if ($exit_code > 0 && ($exit_code >> 8) == 1) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+sub configure_cups_sandbox {
+    if (!is_mac_10_10_or_above_sandboxing_enabled()) {
+        return;
+    }
+
+    print "Configuring CUPS sandbox ...\n";
+    system("cp /etc/cups/cups-files.conf /etc/cups/cups-files.conf.pc-bak");
+    open(CUPSCONF, ">>/etc/cups/cups-files.conf") or die("Unable to modify /etc/cups-files.conf.");
+    print CUPSCONF "Sandboxing relaxed\n";
+    close(CUPSCONF);
+    restart_cups();
+    print "Sandboxing successfully configured\n\n";
+}
+
+sub restart_cups {
+    print "Restarting CUPS ...\n";
+    if (`uname` =~ /Darwin/i) {
+        # macOS Sonoma 14.4 or later doesn't allow using `launchctl stop org.cups.cupsd` to restart cupsd. So, we use
+        # `killall cupsd` instead. Prior to 14.4, cupsd would automatically be restarted after it was killed. As this no
+        # longer occurs, we need to explicitly start it with `launchctl start org.cups.cupsd`. `launchctl start` does
+        # nothing and returns 0 if the service is already running. Therefore, no issue should occur on the prior
+        # versions as well.
+        if (system("pgrep cupsd") == 0) {
+            system("killall cupsd") == 0 or die("Unable to restart CUPS: failed to terminate cupsd.")
+        }
+        system("launchctl start org.cups.cupsd") == 0 or die("Unable to restart CUPS: failed to start cupsd.");
+    } else {
+        if (-e "/etc/init.d/cups") {
+            system("/etc/init.d/cups restart") == 0 or die("Unable to restart CUPS.");
+        } elsif (-e "/etc/init.d/cupsys") {
+            system("/etc/init.d/cupsys restart") == 0 or die("Unable to restart CUPS.");
+        } else {
+            print "IMPORTANT: Please manually restart cupsd to pick up configuration changes.\n";
+        }
+    }
+}
+
+#
+# Locate a printer's PPD file (if exists)
+#
+sub locate_ppd {
+    my ($printer) = @_;
+    my $ppd_dir = "$cups_dir/ppd";
+
+    my $expected_path = "$ppd_dir/$printer.ppd";
+    if (-e $expected_path) {
+        return $expected_path;
+    } else {
+        return "";
+    }
+}
+
+#
+# See if the printer uses cupsPreFilter
+# which will preempt the PaperCut filter,
+#
+sub is_using_cupsprefilter {
+    my ($printer) = @_;
+
+    my $ppd = locate_ppd($printer);
+    if ($ppd =~ /^$/) {
+        return 0;
+    } else {
+        open PPD, "< $ppd" or die "Unable to open $ppd : $!";
+        while (<PPD>) {
+            my $line = $_;
+            if ($line =~ /^\s*\*cupsPreFilter\:/) {
+                close PPD;
+                return 1;
+            }
+        }
+        close PPD;
+        return 0;
+    }
+}
+
+
+#
+# See if the printer uses a Mac PrintJobMgr
+#   (/System/Library/Printers/Libraries/PrintJobMgr)
+# based filter.
+#
+sub is_using_printmgr_filter {
+    my ($printer) = @_;
+
+    my $ppd = locate_ppd($printer);
+    if ($ppd =~ /^$/) {
+        return 0;
+    } else {
+        open PPD, "< $ppd" or die "Unable to open $ppd : $!";
+        while (<PPD>) {
+            my $line = $_;
+            if ($line =~ /^\s*\*(?:original)?[Cc]upsFilter[2]?\:.*(PrintJobMgr|pdftopm)/) {
+                close PPD;
+                return 1;
+            }
+        }
+        close PPD;
+        return 0;
+    }
+}
+
+#
+# See if the printer uses a Xerox filter
+#
+sub is_using_xerox_filter {
+    my ($printer) = @_;
+
+    return is_using_given_filter($printer, "Xerox");
+}
+
+#
+# See if the printer uses a given filter for a given printer
+#
+sub is_using_given_filter {
+    my ($printer, $filter_name) = @_;
+
+    my $ppd = locate_ppd($printer);
+    if ($ppd =~ /^$/) {
+        return 0;
+    } else {
+        open PPD, "< $ppd" or die "Unable to open $ppd : $!";
+        while (<PPD>) {
+            my $line = $_;
+            if ($line =~ /^\s*\*(?:original)?[Cc]upsFilter[2]?\:.*$filter_name/) {
+                close PPD;
+                return 1;
+            }
+        }
+        close PPD;
+        return 0;
+    }
+}
+
+#
+# See if the system is using the prastertoescp filter (an Epson Filter) e.g.
+#   /Library/Printers/EPSON/InkjetPrinter/Filter/rastertoescp.app/Contents/MacOS/rastertoescp
+# Or
+#    pdftoescpage
+# as seen in the new drivers for the EPSON Stylus Pro 4880C
+# Or
+#    /Library/Printers/EPSON/InkjetPrinter2/Filter/epsonpdftoescp.app/Contents/MacOS/epsonpdftoescp
+# as seen for EPSON sc-t3000
+#
+sub is_using_epson_filter {
+    my ($printer) = @_;
+
+    my $ppd = locate_ppd($printer);
+    if ($ppd =~ /^$/) {
+        return 0;
+    } else {
+        # If we don't have a PPD or unable to open it, then let's assume NO.
+        open PPD, "< $ppd" or return 0;
+        while (<PPD>) {
+            my $line = $_;
+            if ($line =~ /^\s*\*(?:original)?[cC]upsFilter[2]?\:.*(rastertoescp)/i) {
+                close PPD;
+                return 1;
+            }
+            if ($line =~ /^\s*\*(?:original)?[cC]upsFilter[2]?\:.*epsonpdftoescp/i) {
+                close PPD;
+                return 1;
+            }
+            if ($line =~ /^\s*\*(?:original)?[cC]upsFilter[2]?\:.*pdftoescpage/i) {
+                close PPD;
+                return 1;
+            }
+        }
+        close PPD;
+        return 0;
+    }
+}
+
+#
+# See if the system is using the garopdftopdl filter (a Canon Filter) e.g.
+#     /Library/Printers/Canon/GARO/2007F/Filters/garopdftopdl
+# as seen in the new drivers for the Canon iFP5100.
+#
+sub is_using_garo_filter {
+    my ($printer) = @_;
+
+    my $ppd = locate_ppd($printer);
+    if ($ppd =~ /^$/) {
+        return 0;
+    } else {
+        # If we don't have a PPD or unable to open it, then let's assume NO.
+        open PPD, "< $ppd" or return 0;
+        while (<PPD>) {
+            my $line = $_;
+            if ($line =~ /^\s*\*(?:original)?[cC]upsFilter[2]?\:.*(garopdftopdl)/i) {
+                close PPD;
+                return 1;
+            }
+        }
+        close PPD;
+        return 0;
+    }
+}
+
+# See if the system is using the Raster2CanonIJ filter (a Canon Filter) e.g.
+#     /Library/Printers/Canon/BJPrinter/Filters/Raster2CanonIJ/Raster2CanonIJ.bundle/Contents/MacOS/Raster2CanonIJ
+# as seen in the new drivers for the Canon Pro9000.
+#
+sub is_using_canonij_filter {
+    my ($printer) = @_;
+
+    my $ppd = locate_ppd($printer);
+    if ($ppd =~ /^$/) {
+        return 0;
+    } else {
+        # If we don't have a PPD or unable to open it, then let's assume NO.
+        open PPD, "< $ppd" or return 0;
+        while (<PPD>) {
+            my $line = $_;
+            if ($line =~ /^\s*\*(?:original)?[cC]upsFilter[2]?\:.*(Raster2CanonIJ)/i) {
+                close PPD;
+                return 1;
+            }
+        }
+        close PPD;
+        return 0;
+    }
+}
+
+# See if the system is using the Canon UFR II PRinter Driver filter (a Canon Filter) e.g.
+#     /Library/Printers/Canon/UFR2/Cores/cupstomcdufr2/Contents/MacOS/cupstomcdufr2
+# as seen in the new drivers for the Canon Image Runner Advance C5035F (see ticket QJB-432-87154)
+#
+sub is_using_canonufr_filter {
+    my ($printer) = @_;
+
+    my $ppd = locate_ppd($printer);
+    if ($ppd =~ /^$/) {
+        return 0;
+    } else {
+        # If we don't have a PPD or unable to open it, then let's assume NO.
+        open PPD, "< $ppd" or return 0;
+        while (<PPD>) {
+            my $line = $_;
+            if ($line =~ /^\s*\*(?:original)?[cC]upsFilter[2]?\:.*(cupstomcdufr2)/i) {
+                close PPD;
+                return 1;
+            }
+        }
+        close PPD;
+        return 0;
+    }
+}
+
+
+# See if the system is using the Canon CAPD Driver filter (a Canon Filter) e.g.
+#     /Library/Printers/Canon/CUPS_Printer/Bins/capdftopdl
+# as seen in the drivers for the Canon LBP 6710 (see ticket JDE-215-80458)
+#
+sub is_using_canonlbp6710_filter {
+    my ($printer) = @_;
+
+    my $ppd = locate_ppd($printer);
+    if ($ppd =~ /^$/) {
+        return 0;
+    } else {
+        # If we don't have a PPD or unable to open it, then let's assume NO.
+        open PPD, "< $ppd" or return 0;
+        while (<PPD>) {
+            my $line = $_;
+            if ($line =~ /^\s*\*(?:original)?[cC]upsFilter[2]?\:.*(capdftopdl)/i) {
+                close PPD;
+                return 1;
+            }
+        }
+        close PPD;
+        return 0;
+    }
+}
+
+
+#
+# See if a printer is currently using our provider filter.
+#
+sub is_using_provider_filter {
+    my ($printer, $filter_name) = @_;
+
+    my $ppd = locate_ppd($printer);
+    if ($ppd =~ /^$/) {
+        return 0;
+    } else {
+        open PPD, "< $ppd" or die "Unable to open $ppd : $!";
+        while (<PPD>) {
+            my $line = $_;
+            if ($line =~ /^\s*\*cupsFilter[2]?\:.*$filter_name/) {
+                close PPD;
+                return 1;
+            } elsif ($line =~ /^\s*\*cupsPreFilter\:.*$filter_name/) {
+                close PPD;
+                return 1;
+            }
+        }
+        close PPD;
+        return 0;
+    }
+}
+
+# Check whether "expert enable filter" option has been set by the user, and if so, prompt them
+# as to whether they "really mean it" in case we notice something unexpected (ie, we only expect to find
+# one filter of the kind we are replacing, not two or more)
+sub expert_prompt_yn {
+    my ($cups_filter_type, $ppd_arg, $expert_enable_filter) = @_;
+    if ($expert_enable_filter) {
+        my $filters=`grep '$cups_filter_type:' $ppd_arg | grep -v 'application/vnd.cups-command' | wc -l`;
+        chomp($filters);
+        if ($filters ne "1") {
+            printf("WARNING: Applying cups filter in expert mode and found more than 1 filter: %s\n", $filters);
+            printf("Do you want to cancel enabling of the filter - (y)es or (n)o\n");
+            my $response = <STDIN>;
+            print "\n";
+            if ($response =~ /y/i) {
+                printf("Abandoning enabling of filter\n");
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+#
+# Replace the current prefilter in the PPD with our provider filter
+#
+sub replace_ppd_prefilter {
+    my ($printer, $new_filter, $expert_enable_filter) = @_;
+
+    my $ppd = locate_ppd($printer);
+    if ($ppd =~ /^$/) {
+        print STDERR "ERROR: Unable to locate PPD\n";
+        return 0;
+    }
+    my $ppd_arg = quotemeta($ppd);
+
+    my $tmp_ppd = "$ppd.tmp";
+
+    # If expert enabling the filter, warn if found a number of filters to replace
+    # as it may indicate we could have a problem
+    if (!expert_prompt_yn("cupsPreFilter", $ppd_arg, $expert_enable_filter)) {
+       return 0;
+    }
+
+    open ORIG, "< $ppd" or die "Unable to open $ppd : $!";
+    open NEW, "> $tmp_ppd" or die "Unable to open $tmp_ppd : $!";
+
+    while (<ORIG>) {
+        my $line = $_;
+        # *cupsFilter: "application/vnd.cups-raster 0 /Library/Printers/...../rastertoescpII"
+        if ($line =~ /^\s*\*cupsPreFilter\:\s*"(\S+)\s+(\S+)\s(\S+)"$/i) {
+            #                               mime    0    cmd
+            my $mime = $1;
+            # do _NOT_ replace a cups-command which is used for maintenance
+            # skip over these
+            # seen on Epson Stylus Pro 4000 on Mac (support s17336)
+            if ($mime eq "application/vnd.cups-command") {
+                print NEW $line;
+                next;
+            }
+            my $cost = $2;
+            my $current_filter = $3;
+            my $orig = $line;
+            my $new = $line;
+            $new =~ s/$current_filter/$new_filter/;
+            $new =~ s/$cost\s+$new_filter/0 $new_filter/;
+            # The following line is used to signal to our own filter which vendor-supplied original
+            # filter to invoke when we are done with our own work, so that we can transparently "shim"
+            # ourselves into its place while still letting it do its thing
+            my $origCupsPreFilter_line = $orig;
+            $origCupsPreFilter_line =~ s/cupsPreFilter/originalCupsPreFilter/;
+
+            #
+            # Note: We ensure that our new cupsPreFilter is printed first,
+            # although in principle it shouldn't matter, because we have set a zero cost to
+            # to make it get executed preferentially, nonetheless, at least some CUPS versions
+            # seem to disregard this, and simply execute preferentially whichever cupsPreFilter
+            # appears earliest in the PPD
+            #
+            #
+            print NEW "$new";
+            print NEW "$orig";
+            print NEW $origCupsPreFilter_line;
+        } else {
+            print NEW $line;
+        }
+    }
+    close ORIG;
+    close NEW;
+
+    my $ret = 0;
+    if (-e $tmp_ppd) {
+       $ret = change_ppd_file($printer, $tmp_ppd);
+    } else {
+       warn "Cannot find PPD: $tmp_ppd";
+       exit -1;
+    }
+    return $ret;
+}
+#
+# Replace the current filter in the PPD with our provider filter
+#
+sub replace_ppd_filter {
+    my ($printer, $new_filter, $expert_enable_filter) = @_;
+
+    my $ppd = locate_ppd($printer);
+    if ($ppd =~ /^$/) {
+        print STDERR "ERROR: Unable to locate PPD\n";
+        return 0;
+    }
+    my $ppd_arg = quotemeta($ppd);
+
+    my $tmp_ppd = "$ppd.tmp";
+
+    # If expert enabling the filter, warn if found a number of filters to replace
+    # as it may indicate we could have a problem
+    if (!expert_prompt_yn("cupsFilter", $ppd_arg, $expert_enable_filter)) {
+       return 0;
+    }
+
+    open ORIG, "< $ppd" or die "Unable to open $ppd : $!";
+    open NEW, "> $tmp_ppd" or die "Unable to open $tmp_ppd : $!";
+
+    while (<ORIG>) {
+        my $line = $_;
+        # *cupsFilter: "application/vnd.cups-raster 0 /Library/Printers/...../rastertoescpII"
+        # Note: cupsFilter2 has a different format - it has a source and dest mimetype
+        # *cupsFilter2: "application/pdf application/octet-stream 0 /Library/Printers/Canon/CUPS_Printer/Bins/capdftopdl"
+        if ($line =~ /^\s*\*cupsFilter[2]?\:\s*"(\S+)(?:\s+\S+){1,2}\s(\S+)"$/i) {
+
+            # do _NOT_ replace a cups-command which is used for maintenance
+            # skip over these
+            # seen on Epson Stylus Pro 4000 on Mac (support s17336)
+            my $mime = $1;
+            if ($mime eq "application/vnd.cups-command") {
+                print NEW $line;
+                next;
+            }
+
+            my $current_filter = $2;
+            my $orig = $line;
+            my $new = $line;
+            $new =~ s/$current_filter/$new_filter/;
+            $orig =~ s/cupsFilter/originalCupsFilter/i;
+
+            #
+            # Ensure that the original is printed first
+            #
+            print NEW "$orig";
+            print NEW "$new";
+        } else {
+            print NEW $line;
+        }
+    }
+    close ORIG;
+    close NEW;
+
+    my $ret = change_ppd_file($printer, $tmp_ppd);
+    return $ret;
+}
+
+#
+# Replace the current filter in the PPD with our provider filter
+# Only replace the one which matches with $old_filter and leave
+# the other ones alone
+#
+# Introduced this for the CanonRasterIJ Filter.
+# For Canon Pro 9000, it has multiple filters and I only want to
+# to do a replacement for the CanonRasterIJ Filter and none of the others.
+# This function, may be useful for other printers in the future.
+#
+sub replace_specific_ppd_filter {
+    my ($printer, $old_filter, $new_filter) = @_;
+
+    my $ppd = locate_ppd($printer);
+    if ($ppd =~ /^$/) {
+        print STDERR "ERROR: Unable to locate PPD\n";
+        return 0;
+    }
+
+    my $tmp_ppd = "$ppd.tmp";
+
+    open ORIG, "< $ppd" or die "Unable to open $ppd : $!";
+    open NEW, "> $tmp_ppd" or die "Unable to open $tmp_ppd : $!";
+
+    while (<ORIG>) {
+        my $line = $_;
+        # *cupsFilter: "application/vnd.cups-raster 0 /Library/Printers/...../rastertoescpII"
+        if ($line =~ /^\s*\*cupsFilter[2]?\:\s*"(\S+)(?:\s+\S+){1,2}\s(\S+)"$/i) {
+            #                                   mime1                 filter
+            my $mime = $1;
+            my $current_filter = $2;
+
+            # don't change ones which don't match with our specific filter
+            if (!($current_filter =~ /$old_filter/)) {
+                print NEW $line;
+                next;
+            }
+
+            my $orig = $line;
+            my $new = $line;
+            $new =~ s/$current_filter/$new_filter/;
+            $orig =~ s/cupsFilter/originalCupsFilter/i;
+
+            #
+            # Ensure that the original is printed first
+            #
+            print NEW "$orig";
+            print NEW "$new";
+        } else {
+            print NEW $line;
+        }
+    }
+    close ORIG;
+    close NEW;
+
+    my $ret = change_ppd_file($printer, $tmp_ppd);
+    return $ret;
+}
+
+sub change_ppd_file {
+    my ($printer, $ppd_file) = @_;
+
+    my $printer_arg = quotemeta($printer);
+    my $ppd_file_arg = quotemeta($ppd_file);
+
+    my $backup = $ppd_file . "." . timestamp();
+    my $backup_arg = quotemeta($backup);
+
+    # Create a backup of the current PPD
+    print `cp $ppd_file_arg $backup_arg`;
+    print `lpadmin -p $printer_arg -P $ppd_file_arg`;
+    if ($?) {
+        print "lpadmin failed modifying printer \"$printer\" with ppd-file \"$ppd_file\"\n";
+        return 0;
+    }
+    return 1;
+}
+
+#
+# Restore the PPD's original filter. e.g. Remove our own.
+#
+sub restore_ppd_filter {
+    my ($printer,$filtername) = @_;
+    my $found_our_filter = 0;
+    my $ppd = locate_ppd($printer);
+    if ($ppd =~ /^$/) {
+        print STDERR "ERROR: Unable to locate PPD\n";
+        return 0;
+    }
+
+    my $tmp_ppd = "$ppd.tmp";
+
+    open ORIG, "< $ppd" or die "Unable to open $ppd : $!";
+    open NEW, "> $tmp_ppd" or die "Unable to open $tmp_ppd : $!";
+
+    my $new = "";
+    while (<ORIG>) {
+        my $line = $_;
+        if ($line =~ /^\s*\*originalCupsFilter[2]?\:/i) {
+            $new = $line;
+            $new =~ s/originalCupsFilter/cupsFilter/i;
+            $found_our_filter = 1;
+        } elsif ($line =~ /^\s*\*cupsFilter[2]?\:\s*"(\S+)(?:\s+\S+){1,2}\s\S+"$/i) {
+            #                                        mime
+            my $mime = $1;
+            if ($mime eq "application/vnd.cups-command") {
+                print NEW $line;
+            } elsif ($new !~ /^$/) { # new is not empty - have original
+                print NEW $new;
+            } else {
+                print NEW $line;
+            }
+        } elsif ($line =~ /^\s*\*cupsPreFilter\:.*$filtername.*/) {
+            #Omit this line to remove our own cupsPreFilter
+            $found_our_filter = 1;
+        } elsif ($line =~ /^\s*\*originalCupsPreFilter\:.*/) {
+            #Omit this line to remove the "originalCupsPreFilter" bookmark we earlier inserted
+            $found_our_filter = 1;
+        } else {
+            print NEW $line;
+        }
+    }
+    close ORIG;
+    close NEW;
+
+    if (!$found_our_filter) {
+       print STDERR "ERROR: did not find PaperCut cupsFilter or cupsPreFilter to remove!\n";
+    }
+
+    my $ret = change_ppd_file($printer, $tmp_ppd);
+    unlink $tmp_ppd;
+    return $ret;
+}
+
+#
+# Restore the PPD's original filter. e.g. Remove our own.
+# Actually look for our prefix (typ. "papercut") filter to delete.
+#
+# Looks for: originalCupsFilter: ....
+# Looks for: cupsFilter: mime score prefix  (where prefix is typically "papercut")
+#
+sub restore_specific_ppd_filter {
+    my ($printer, $prefix) = @_;
+
+    my $ppd = locate_ppd($printer);
+    if ($ppd =~ /^$/) {
+        print STDERR "ERROR: Unable to locate PPD\n";
+        return 0;
+    }
+
+    my $tmp_ppd = "$ppd.tmp";
+
+    open ORIG, "< $ppd" or die "Unable to open $ppd : $!";
+    open NEW, "> $tmp_ppd" or die "Unable to open $tmp_ppd : $!";
+
+    my $new = "";
+    while (<ORIG>) {
+        my $line = $_;
+        if ($line =~ /^\s*\*originalCupsFilter[2]?\:/i) {
+            $new = $line;
+            $new =~ s/originalCupsFilter/cupsFilter/i;
+        } elsif ($line =~ /^\s*\*cupsFilter[2]?\:\s*"(\S+)(?:\s+\S+){1,2}\s+$prefix"$/i) {
+                 #                               mime  score filter
+                 #                          2    mime  mime2 score filter
+            my $mime = $1;
+            if ($mime eq "application/vnd.cups-command") {
+                print NEW $line;
+            } elsif ($new !~ /^$/) { # new is not empty - have original
+                print NEW $new;
+            } else {
+                print STDERR "ERROR: no originalCupsFilter!\n";
+            }
+        } else {
+            print NEW $line;
+        }
+    }
+    close ORIG;
+    close NEW;
+
+    my $ret = change_ppd_file($printer, $tmp_ppd);
+    unlink $tmp_ppd;
+    return $ret;
+}
+
+sub printername {
+    my ($printer, $printer_full_name) = @_;
+    if ($printer_full_name =~ /^\s*$/) {
+        return $printer;
+    } else {
+        return "$printer ($printer_full_name)";
+    }
+}
+
+sub timestamp {
+    my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+    return sprintf "%4d-%02d-%02d-%02d-%02d-%02d", $year+1900,$mon+1,$mday,$hour,$min,$sec;
+}
+
+sub getservername {
+    my $hostname = hostname();
+    return $hostname;
+}
+
+#
+# return true if uri has a @ symbol and we think it has credentials
+# return false otherwise
+#
+sub has_credentials {
+    my ($uri) = @_;
+    return $uri =~ /@/;
+}
+
+#
+# Convert already enabled printers that have creds in URI to be in a format
+# which doesn't expose the credentials.
+# This means requiring credentials only at the start (for CUPS to hide)
+# and putting in URL conformant format.
+# Return 1 if made a change otherwise if no change then return 0.
+# NOTE: need this to be idempotent - can run over again without issues
+#
+sub make_conformant {
+    my ($printer, $uri_line) = @_;
+
+    # from: papercut:ipp://user:password@toshiba2555c:631/ipp
+    # to:   papercut://user:password@toshiba2555c:631/ipp?papercut:ipp://toshiba2555c:631/ipp
+    my $original_uri_line = restore_old_backend_line($uri_line);
+    my $new_uri_line = add_url_conformant_papercut_backend_line($original_uri_line);
+    if ($new_uri_line ne $uri_line) {
+        my $uri = extract_uri_from_line($new_uri_line);
+        change_device_uri($uri, $printer);
+        return 1;
+    }
+    return 0;
+}
+
+#
+# restore device URI back to what it was before we added papercut backend
+#
+sub restore_old_backend_line {
+    my ($uri) = @_;
+
+    # Change back in it's the url conformant form.
+    if ($uri =~ /\?$prefix:/) {
+
+        # extract any creds between // and @
+        # from:   DeviceURI papercut://user:password@blahblah?papercut:origbackend:blahblah
+        # to:     user:password
+        my $creds = $uri;
+        $creds =~ s#.*?//(.*?)@.*#$1#;
+
+        # from:   DeviceURI papercut:blahblah?papercut:origbackend:blahblah
+        # to:     DeviceURI origbackend:blahblah
+        # remove everything before this match and after DeviceURI
+        $uri =~ s/DeviceURI\s+.*\?$prefix:/DeviceURI /i;
+
+        # Put back any credentials
+        # from: ipp://toshiba2555c:631/ipp
+        # to:   ipp://user:password@toshiba2555c:631/ipp
+        if ($creds ne "") {
+            $uri =~ s#//#//$creds@#;
+        }
+
+        return $uri;
+    }
+
+    # Change back if it's the prefixed form.
+    # remove the leading $prefix:
+    $uri =~ s/DeviceURI\s+$prefix:/DeviceURI /i;
+    return $uri;
+}
+
+sub change_device_uri {
+    my ($uri, $printer) = @_;
+    my $printer_arg = quotemeta($printer);
+    my $uri_arg = quotemeta($uri);
+    print `lpadmin -p $printer_arg -v $uri_arg`;
+    if ($?) {
+        print "lpadmin failed modifying printer \"$printer\" with uri \"$uri\"\n";
+        return 0;
+    }
+    return 1;
+}
+
+sub extract_uri_from_line {
+    my ($uri_line) = @_;
+    $uri_line =~ s/DeviceURI\s+//i;
+    return $uri_line;
+}
+
+sub restore_old_backend {
+    my ($printer, $uri_line) = @_;
+
+    $uri_line = restore_old_backend_line $uri_line;
+    my $uri = extract_uri_from_line($uri_line);
+    return change_device_uri($uri, $printer);
+}
+
+sub add_papercut_backend_line {
+    my ($uri) = @_;
+
+    # Simply prefix the DeviceURL
+    $uri =~ s/DeviceURI\s+/DeviceURI $prefix:/i;
+    return $uri;
+}
+
+sub add_papercut_backend {
+    my ($printer, $uri_line) = @_;
+
+    $uri_line = add_papercut_backend_line($uri_line);
+    my $uri = extract_uri_from_line($uri_line);
+    return change_device_uri($uri, $printer);
+}
+
+#
+# Add papercut backend to uri
+#
+sub add_url_conformant_papercut_backend_line {
+    my ($uri) = @_;
+
+    # Some drivers/filters expect a URL conformant backend (e.g. to parse out the hostname).
+    # We maintain this by moving a copy of our origional backend after a "?" params portion.
+    #
+    # from: DeviceURI origbackend:my.printer.hostname
+    # to:   DeviceURI papercut:my.printer.hostname?papercut:origbackend:my.printer.hostname
+    $uri =~ s/DeviceURI\s+(\w+:)(.*)/DeviceURI $prefix:$2?$prefix:$1$2/i;
+
+    # Remove any credentials after ? and between // and @ in the URI of the form: ?papercut:ipp//credentials@host/ipp...
+    # from: papercut://user:password@toshiba2555c:631/ipp?papercut:ipp://user:password@toshiba2555c:631/ipp
+    # to:   papercut://user:password@toshiba2555c:631/ipp?papercut:ipp://toshiba2555c:631/ipp
+    $uri =~ s#\?(.*?)//.*@#?$1//#;
+
+    return $uri;
+}
+
+sub add_url_conformant_papercut_backend {
+    my ($printer, $uri_line) = @_;
+
+    $uri_line = add_url_conformant_papercut_backend_line($uri_line);
+    my $uri = extract_uri_from_line($uri_line);
+    return change_device_uri($uri, $printer);
+}
+
+sub delete_pp_config {
+    my $config_key = $_[0];
+
+    if (! -w $pp_config_file) {
+        warn "print-provider.conf not found or not writable.\n";
+        return 0;
+    }
+
+    my $tmpfile = $pp_config_file . "." . timestamp();
+    if (system("cp $pp_config_file $tmpfile") > 0) {
+        warn "Failed to create a temp file.\n";
+        return 0;
+    }
+    open(my $in, '<', "$tmpfile") or return 0;
+    open(my $out, '>', "$pp_config_file") or return 0;
+
+    # If config found, comment out the line
+    while (<$in>) {
+        ($_ =~ /^ *$config_key/) ? print $out "#$_" : print $out $_;
+    }
+
+    close($in);
+    close($out);
+
+    return 1;
+}
+
+sub get_pp_config_value {
+    my $k = $_[0];
+
+    my $li = get_pp_config_line($k);
+    if ($li eq "") {
+        #warn "Config key $k not found\n";
+        return "";
+    }
+
+    my @tk = split '=', $li;
+    if (scalar @tk != 2) {
+        warn "Failed to extract value for key $k\n";
+        return "";
+    }
+    #print "key=$k, line=$li, tokens=@tk, value=$tk[1]\n";
+    return $tk[1];
+}
+
+sub get_pp_config_line {
+    my $key = $_[0];
+
+    if (! -r $pp_config_file) {
+        warn "print-provider.conf not found or not readable.\n";
+        return "";
+    }
+
+    if (open my $config_fh, "<", $pp_config_file) {
+        while (my $line = <$config_fh>) {
+            chomp($line);
+            if ($line =~ /^$key/i) {
+                return $line;
+            }
+        }
+    }
+    return "";
+}
+
+sub is_pp_config_set {
+    my $k = $_[0];
+
+    my $v = get_pp_config_value($k);
+    if ($v eq "") {
+        warn "Failed to read config value for $k\n";
+        return 0;
+    }
+
+    $v =~ /on|yes|true/i ? return 1 : return 0;
+}
+
+sub restart_pp {
+    my $c = "";
+    if (`uname` =~ /Darwin/i) {
+        $c = "launchctl stop $prefix.pc-event-monitor";
+    } else {
+        my $hassystemd = `cat /proc/1/comm`;
+        chomp($hassystemd);
+        if ($hassystemd eq "systemd") {
+            $c = "systemctl restart pc-event-monitor.service";
+        } else {
+            $c = "/etc/init.d/$prefix-event-monitor restart";
+        }
+    }
+    my $ret = system($c);
+    if ($ret > 0) {
+        warn "Failed to restart the Print Provider\n";
+    }
+    sleep(2);
+}
+
+=head1 NAME
+
+configure-cups - configure /etc/cups/printers.conf to enable monitoring of printers for PaperCut
+
+=head1 SYNOPSIS
+
+  --add-all        Add all printers for monitoring
+  --remove-all     Remove all printers for monitoring
+  --list-all       List all printers (monitored and not monitored)
+  --expert         Expert mode
+  --list           List all monitored printers
+  --add printer    Add a printer to be monitored
+  --remove printer Remove a printer from being monitored
+  --relax-sandbox  Only relax sandbox by modifying cups-files.conf and restarting CUPS
+  --hidecreds      Fix device URI to allow hiding of credentials
+  --help           Print this help text
+
+=cut
+
+1;
